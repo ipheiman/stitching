@@ -85,6 +85,8 @@ class GridStitcher:
                 img1_full=img, img2_full=img_neigh, horizontal=horizontal
             )
 
+        # matches (keypoints1)
+        # matches_neigh (keypoints2)
         return matches, matches_neigh, conf
 
     def stitch_grid(self, tile_paths, plot_prefix=""):
@@ -113,7 +115,10 @@ class GridStitcher:
         plot_prefix="",
     ):
         """Stitch images in a grid by constructing a minimum spanning tree (MST)
-        using Prim-Jarník's algorithm to estimate the best stitching order.
+        using Prim-Jarník's algorithm to estimate the best stitching order. 
+
+        Weight of edges = -(conf**2).sum(), MST chooses lower weight edges first
+        After choosing edge, the multiple matches are used to estimate a transformation matrix
 
         :param tile_paths: Paths to image tiles in the grid.
         :param transformations: Optional array with precomputed transformations and
@@ -123,7 +128,7 @@ class GridStitcher:
         :param plot_prefix: Prefix for plots generated during stitching.
         :return: Stitched grid image and the coordinates of the root tile.
         """
-        grid_size = tile_paths.shape
+        grid_size = tile_paths.shape # eg (5,5)
         tile_count = grid_size[0] * grid_size[1]
         if tile_count < 2:
             raise ValueError(f"Cannot stitch a single tile: {tile_paths[0, 0]}")
@@ -132,45 +137,63 @@ class GridStitcher:
         # By default, the algorithm starts from the middle of the grid so that any
         # misalignments are distributed as evenly as possible.
         if self.cfg.STITCHER.ROOT_TILE:
-            position = self.cfg.STITCHER.ROOT_TILE
+        # if the position of ROOT_TILE is defined
+            position = self.cfg.STITCHER.ROOT_TILE 
         else:
+        # else start stitching from center
             position = (grid_size[0] // 2, grid_size[1] // 2)
+        
+        # Initialize
         node = None
         processed_tiles = 0
-        tile_nodes = []
-        tile_queue = PriorityQueue()
+        tile_nodes = [] # Populated with TileNode objects
+
+        # Each tile_node will be (weight, TileNode)
+        # tile_queue.get().node will return next lowest weight TileNode
+        # Each time you stitch a tile, you push its unprocessed neighbors into the tile_queue.
+        # Seen but not stitched yet
+        tile_queue = PriorityQueue() 
+
+        # tile_states indicates stitched or not stitched
         tile_states = np.zeros(grid_size, dtype=bool)
+
         while processed_tiles < tile_count:
             # Update current position.
-            if processed_tiles > 0:
+            if processed_tiles > 0: 
                 # All tiles neighboring the already processed ones should be already
                 # weighted. Select the best one (unless already selected).
                 try:
                     best_tile = tile_queue.get(block=False).node
                     while tile_states[best_tile.position]:
                         best_tile = tile_queue.get(block=False).node
-                except Empty:
+                except Empty: # All stitched
                     break
 
                 if transformations is None:
+                    # Affine transformation based on SIFT/LOFTR matches
                     best_tile.estimate_transformation()
 
                 tile_nodes.append(best_tile)
                 node = best_tile
+                # (r,c)
                 position = best_tile.position
             processed_tiles += 1
-            tile_states[position] = True
+            tile_states[position] = True # stitched
 
             # Match the current image to its neighbors.
             img = None
             tile_path = tile_paths[position]
+            # neighbours = [(r,c),(r,c),...]
             neighbors = self._get_unprocessed_neighbors(position, tile_states)
             for position_neigh in neighbors:
                 # Load the images.
                 neighbor_path = tile_paths[position_neigh]
+
+                # Initialize first node
                 if img is None:
                     img = self.img_loader.load_img(tile_path)
                     if not tile_nodes:
+                        # Only runs for first ROOT node
                         # The first tile is connected to the tree automatically.
                         if root_transformation is None:
                             transformation = np.identity(3)
@@ -183,16 +206,20 @@ class GridStitcher:
                             transformation=transformation,
                         )
                         tile_nodes.append(node)
+
                 img_neigh = self.img_loader.load_img(neighbor_path)
 
                 if transformations is None:
                     # Compute matches. First image must always be the top or left one.
+                    # kp1, kp2, conf
                     matches, matches_neigh, conf = self.compute_neighbor_matches(
                         position=position,
                         position_neigh=position_neigh,
                         img=img,
                         img_neigh=img_neigh,
                     )
+
+                    # TODO: Add in Hill Climb here to improve matches results
 
                     # Ensure there is enough matches.
                     if len(matches) < 3 or (
@@ -229,6 +256,7 @@ class GridStitcher:
                     )
 
                     # Calculate weight as the negative sum of squared confidence scores.
+                    # 
                     weight = -(conf**2).sum()
                 else:
                     # Use precomputed transformations to construct the neighbor node.
@@ -249,128 +277,7 @@ class GridStitcher:
                 tile_queue.put(WeightedTileNode(weight, node_neigh))
 
         # Find the boundaries of the final image.
-        return self.stitch_mst_nodes(tile_nodes)
-
-    def stitch_grid_slam(self, tile_paths, plot_prefix=""):
-        """Stitch images in a grid using SLAM optimisation. Cannot be done when using
-        full perspective transformations.
-
-        :param tile_paths: Paths to image tiles in the grid.
-        :param plot_prefix: Prefix for plots generated during stitching.
-        :return: Stitched grid image and the coordinates of the reference tile.
-        """
-        if self.cfg.STITCHER.TRANSFORM_TYPE == "perspective":
-            raise ValueError(
-                "Perspective transformations are not supported when "
-                "using SLAM optimisation."
-            )
-
-        grid_size = tile_paths.shape
-        tile_count = grid_size[0] * grid_size[1]
-        if tile_count < 2:
-            raise ValueError(f"Cannot stitch a single tile: {tile_paths[0, 0]}")
-
-        # Find LoFTR or SIFT keypoint matches between each pairs of adjacent image
-        # tiles from the top left image to the bottom right image. Use the matches
-        # to build a SLAM model of the stitched tiles.
-        vertices = {}
-        edges = {}
-        for (row, column), tile_path in np.ndenumerate(tile_paths):
-            # Get neighbors in top-to-bottom, left-to-right order.
-            neighbors = []
-            if row < grid_size[0] - 1:
-                neighbors.append((row + 1, column))
-            if column < grid_size[1] - 1:
-                neighbors.append((row, column + 1))
-
-            img = None
-            node = None
-            for position_neigh in neighbors:
-                # Load the images.
-                neighbor_path = tile_paths[position_neigh]
-                if img is None:
-                    img = self.img_loader.load_img(tile_path)
-                img_neigh = self.img_loader.load_img(neighbor_path)
-
-                # Represent neighbor transformations using a tree.
-                if node is None:
-                    node = TileNode(
-                        cfg=self.cfg,
-                        img=img,
-                        position=(row, column),
-                        transformation=np.identity(3),
-                    )
-
-                # Compute neighbor matches.
-                matches, matches_neigh, conf = self.compute_neighbor_matches(
-                    position=(row, column),
-                    position_neigh=position_neigh,
-                    img=img,
-                    img_neigh=img_neigh,
-                )
-
-                # Make matching figure if desired.
-                if self.cfg.STITCHER.SAVE_MATCHES:
-                    self._plot_matches(
-                        img,
-                        img_neigh,
-                        matches,
-                        matches_neigh,
-                        conf,
-                        (row, column),
-                        position_neigh,
-                        self.cfg.STITCHER.SAVE_MATCHES_FRACTION,
-                        plot_prefix,
-                    )
-
-                # Ensure there is enough matches.
-                if len(matches) < 3:
-                    print(
-                        "Not enough matches found for image pair: "
-                        f"{(tile_path, neighbor_path)}"
-                    )
-                    continue
-
-                # Calculate the neighbor transformation.
-                node_neigh = TileNode(
-                    cfg=self.cfg,
-                    img=img_neigh,
-                    position=position_neigh,
-                    parent=node,
-                    matches=matches_neigh,
-                    matches_parent=matches,
-                )
-                node_neigh.estimate_transformation()
-                pose = node_neigh.remove_scaling()
-
-                # Build vertices with initial position estimates.
-                index = row * grid_size[1] + column
-                index_neigh = position_neigh[0] * grid_size[1] + position_neigh[1]
-                if index not in vertices:
-                    vertices[index] = self._get_slam_vertex(
-                        img, (row, column), grid_size
-                    )
-                if index_neigh not in vertices:
-                    vertices[index_neigh] = self._get_slam_vertex(
-                        img_neigh, position_neigh, grid_size
-                    )
-
-                # Add edges with homography-based translation and rotation estimates.
-                edge_index = f"{index}_{index_neigh}"
-                edges[edge_index] = self._get_slam_edge(index, index_neigh, pose)
-
-        # Build the SLAM graph and optimise.
-        slam_graph = Graph(list(edges.values()), list(vertices.values()))
-        stdout = sys.stdout
-        try:
-            sys.stdout = io.StringIO()
-            slam_graph.optimize()
-        finally:
-            sys.stdout = stdout
-
-        # Convert the graph to a simple MST (all nodes connected directly to
-        # the root node) and stitch the grid using MST stitching.
-        tile_nodes = self._slam_graph_to_mst(vertices, tile_paths)
+        # When it exits the while loop, means all tiles are processed, ready to stitch
         return self.stitch_mst_nodes(tile_nodes)
 
     def stitch_mst_nodes(self, tile_nodes):
@@ -380,15 +287,21 @@ class GridStitcher:
         :return: Final stitched grid image and the coordinates of the root tile.
         """
         # Find the boundaries of the final image.
+        # ([minX, maxX], [minY, maxY])
         grid_boundary = self._get_grid_boundary(tile_nodes)
 
         # Calculate the corresponding translation matrix and the resulting shape.
         T = np.identity(3)
-        if grid_boundary[0, 0] < 0:
-            T[0, 2] = -grid_boundary[0, 0]
-        if grid_boundary[1, 0] < 0:
-            T[1, 2] = -grid_boundary[1, 0]
 
+        # If minX or minY is <0, will be cut off from the image, so need to shift
+        # minX
+        if grid_boundary[0, 0] < 0:
+            T[0, 2] = -grid_boundary[0, 0] # becomes +ve
+        # minY
+        if grid_boundary[1, 0] < 0:
+            T[1, 2] = -grid_boundary[1, 0] # becomes +ve
+
+        # Calculate the shape (width and height) of the final stitched image after warping
         result_shape = (
             round(grid_boundary[0, 1] - grid_boundary[0, 0]),
             round(grid_boundary[1, 1] - grid_boundary[1, 0]),
@@ -398,18 +311,23 @@ class GridStitcher:
         if self.cfg.STITCHER.COLORED_OUTPUT:
             tile_nodes[0].color_coat_image()
         M = T @ tile_nodes[0].transformation
+        # Stitch First tile
         stitched_image = cv2.warpPerspective(
             tile_nodes[0].img, M, result_shape, flags=cv2.INTER_NEAREST
         )
+        # Stitch Second tile onwards...
         for tile_node in tile_nodes[1:]:
             if self.cfg.STITCHER.COLORED_OUTPUT:
                 tile_node.color_coat_image()
+
+            # Stitch to existing image
             stitched_image = self.tile_stitcher.stitch_tile(
                 stitched_image, tile_node, T
             )
         return stitched_image, (T[0, 2], T[1, 2])
 
     def _get_grid_boundary(self, tile_nodes):
+        # Calculates how large the stitched image canvas needs to be to fit all transformed tiles
         """Calculate the bounding coordinates of the given image grid after warping.
 
         :param tile_nodes: Image tiles with computed transformations.
@@ -449,157 +367,6 @@ class GridStitcher:
             neighbors.append((row, column + 1))
 
         return neighbors
-
-    def _get_slam_vertex(self, img, position, grid_size, fixed_first=True):
-        """Constructs a new vertex of a SLAM graph in the middle of the given tile.
-
-        :param img: Image tile for which the vertex should be created.
-        :param position: Position of the image tile.
-        :param grid_size: Size of the stitched grid.
-        :param fixed: Whether the vertex position should remain fixed during
-                      optimisation when it is the first vertex in the grid.
-        :return: New SLAM vertex.
-        """
-        index = position[0] * grid_size[1] + position[1]
-        fixed = fixed_first and index == 0
-        pos_x = img.shape[1] // 2 + position[1] * (
-            img.shape[1] * (1 - self.cfg.DATASET.TILE_OVERLAP)
-        )
-        pos_y = img.shape[0] // 2 + position[0] * (
-            img.shape[0] * (1 - self.cfg.DATASET.TILE_OVERLAP)
-        )
-        return Vertex(index, PoseSE2((pos_x, pos_y), 0), fixed=fixed)
-
-    def _get_slam_edge(self, index, index_neigh, pose):
-        """Constructs a new SLAM graph edge.
-
-        :param index: Index of the source vertex.
-        :param index_neigh: Index of the destination vertex.
-        :param pose: Pose associated with the edge.
-        :return: New SLAM edge.
-        """
-        # Create the information matrix.
-        information = upper_triangular_matrix_to_full_matrix(
-            self.cfg.STITCHER.EDGE_INFORMATION, 3
-        )
-        return EdgeOdometry(
-            vertex_ids=(index, index_neigh),
-            information=information,
-            estimate=PoseSE2((pose[0], pose[1]), pose[2]),
-        )
-
-    def _slam_graph_to_mst(self, vertices, tile_paths):
-        """Converts a SLAM graph that represents a grid of stitched images to a MST.
-
-        :param vertices: Indexed dictionary of SLAM graph vertices.
-        :param tile_paths: Paths to image tiles in the grid.
-        :return: List of image tile nodes representing the constructed MST.
-        """
-        # Get the starting position.
-        grid_size = tile_paths.shape
-        if self.cfg.STITCHER.ROOT_TILE:
-            position_root = self.cfg.STITCHER.ROOT_TILE
-        else:
-            position_root = (grid_size[0] // 2, grid_size[1] // 2)
-
-        # Create the root node.
-        index = position_root[0] * grid_size[1] + position_root[1]
-        pose_root = vertices[index].pose
-        root = TileNode(
-            cfg=self.cfg,
-            img=self.img_loader.load_img(tile_paths[position_root]),
-            position=position_root,
-            transformation=np.identity(3),
-        )
-        tile_nodes = [root]
-
-        # Create the remaining nodes and connect them directly to the root noce.
-        for position, tile_path in np.ndenumerate(tile_paths):
-            if position == position_root:
-                continue
-
-            # Load the current image.
-            img = self.img_loader.load_img(tile_path)
-
-            # Calculate translation and rotation matrices based on pose difference
-            # to root.
-            index = position[0] * grid_size[1] + position[1]
-            pose_node = vertices[index].pose
-            pose_difference = pose_node - pose_root
-
-            T = np.identity(3)
-            R = np.identity(3)
-
-            T[0, 2] = pose_difference[0]
-            T[1, 2] = pose_difference[1]
-            R[0, 0] = np.cos(pose_difference[2])
-            R[0, 1] = -np.sin(pose_difference[2])
-            R[1, 0] = -R[0, 1]
-            R[1, 1] = R[0, 0]
-
-            # Add the neighbor node to the MST.
-            node = TileNode(
-                cfg=self.cfg,
-                img=img,
-                parent=root,
-                position=position,
-                transformation=(T @ R),
-            )
-            tile_nodes.append(node)
-
-        return tile_nodes
-
-    def _get_slam_transformations(self, vertices, edges, grid_size):
-        """Retrieves transformations between adjacent vertices in a SLAM graph. The
-        transformations are scored by errors corresponding to the associated edge.
-
-        :param vertices: Indexed dictionary of SLAM graph vertices.
-        :param edges: Indexed dictionary of SLAM graph edges.
-        :param grid_size: Size of the stitched grid.
-        :return: Adjacency matrix of scored SLAM graph transformations.
-        """
-        # Go over all vertices (and the tiles they represent) from top to bottom and
-        # left to right and register their transformations.
-        transformations = np.empty((len(vertices), len(vertices)), dtype=object)
-        for (row, column) in np.ndindex(grid_size):
-            # Get neighbors in top-to-bottom, left-to-right order.
-            neighbors = []
-            if row < grid_size[0] - 1:
-                neighbors.append((row + 1, column))
-            if column < grid_size[1] - 1:
-                neighbors.append((row, column + 1))
-
-            for position_neigh in neighbors:
-                index = row * grid_size[1] + column
-                index_neigh = position_neigh[0] * grid_size[1] + position_neigh[1]
-
-                # Calculate translation and rotation matrices based on pose difference.
-                pose_difference = vertices[index_neigh].pose - vertices[index].pose
-
-                T = np.identity(3)
-                R = np.identity(3)
-
-                T[0, 2] = pose_difference[0]
-                T[1, 2] = pose_difference[1]
-                R[0, 0] = np.cos(pose_difference[2])
-                R[0, 1] = -np.sin(pose_difference[2])
-                R[1, 0] = -R[0, 1]
-                R[1, 1] = R[0, 0]
-
-                # Calculate score by comparing against the expected transformation.
-                # Angles are counted in degrees to increase their weight.
-                edge_index = f"{index}_{index_neigh}"
-                edge_estimate = edges[edge_index].estimate
-                error = abs(pose_difference - edge_estimate)
-                error[2] = np.degrees(error[2])
-                score = np.sum(np.array(error))
-
-                # Save the transformation and its score.
-                M = T @ R
-                transformations[index, index_neigh] = (M, score)
-                transformations[index_neigh, index] = (np.linalg.inv(M), score)
-
-        return transformations
 
     def _plot_matches(
         self,
@@ -681,3 +448,279 @@ class GridStitcher:
             dpi=200,
             path=fig_path,
         )
+
+###############################################################################################################3
+    # GRAPH SLAM FUNCTIONS
+    # def _get_slam_vertex(self, img, position, grid_size, fixed_first=True):
+    #     """Constructs a new vertex of a SLAM graph in the middle of the given tile.
+
+    #     :param img: Image tile for which the vertex should be created.
+    #     :param position: Position of the image tile.
+    #     :param grid_size: Size of the stitched grid.
+    #     :param fixed: Whether the vertex position should remain fixed during
+    #                   optimisation when it is the first vertex in the grid.
+    #     :return: New SLAM vertex.
+    #     """
+    #     index = position[0] * grid_size[1] + position[1]
+    #     fixed = fixed_first and index == 0
+    #     pos_x = img.shape[1] // 2 + position[1] * (
+    #         img.shape[1] * (1 - self.cfg.DATASET.TILE_OVERLAP)
+    #     )
+    #     pos_y = img.shape[0] // 2 + position[0] * (
+    #         img.shape[0] * (1 - self.cfg.DATASET.TILE_OVERLAP)
+    #     )
+    #     return Vertex(index, PoseSE2((pos_x, pos_y), 0), fixed=fixed)
+
+    # def _get_slam_edge(self, index, index_neigh, pose):
+    #     """Constructs a new SLAM graph edge.
+
+    #     :param index: Index of the source vertex.
+    #     :param index_neigh: Index of the destination vertex.
+    #     :param pose: Pose associated with the edge.
+    #     :return: New SLAM edge.
+    #     """
+    #     # Create the information matrix.
+    #     information = upper_triangular_matrix_to_full_matrix(
+    #         self.cfg.STITCHER.EDGE_INFORMATION, 3
+    #     )
+    #     return EdgeOdometry(
+    #         vertex_ids=(index, index_neigh),
+    #         information=information,
+    #         estimate=PoseSE2((pose[0], pose[1]), pose[2]),
+    #     )
+
+    # def _slam_graph_to_mst(self, vertices, tile_paths):
+    #     """Converts a SLAM graph that represents a grid of stitched images to a MST.
+
+    #     :param vertices: Indexed dictionary of SLAM graph vertices.
+    #     :param tile_paths: Paths to image tiles in the grid.
+    #     :return: List of image tile nodes representing the constructed MST.
+    #     """
+    #     # Get the starting position.
+    #     grid_size = tile_paths.shape
+    #     if self.cfg.STITCHER.ROOT_TILE:
+    #         position_root = self.cfg.STITCHER.ROOT_TILE
+    #     else:
+    #         position_root = (grid_size[0] // 2, grid_size[1] // 2)
+
+    #     # Create the root node.
+    #     index = position_root[0] * grid_size[1] + position_root[1]
+    #     pose_root = vertices[index].pose
+    #     root = TileNode(
+    #         cfg=self.cfg,
+    #         img=self.img_loader.load_img(tile_paths[position_root]),
+    #         position=position_root,
+    #         transformation=np.identity(3),
+    #     )
+    #     tile_nodes = [root]
+
+    #     # Create the remaining nodes and connect them directly to the root noce.
+    #     for position, tile_path in np.ndenumerate(tile_paths):
+    #         if position == position_root:
+    #             continue
+
+    #         # Load the current image.
+    #         img = self.img_loader.load_img(tile_path)
+
+    #         # Calculate translation and rotation matrices based on pose difference
+    #         # to root.
+    #         index = position[0] * grid_size[1] + position[1]
+    #         pose_node = vertices[index].pose
+    #         pose_difference = pose_node - pose_root
+
+    #         T = np.identity(3)
+    #         R = np.identity(3)
+
+    #         T[0, 2] = pose_difference[0]
+    #         T[1, 2] = pose_difference[1]
+    #         R[0, 0] = np.cos(pose_difference[2])
+    #         R[0, 1] = -np.sin(pose_difference[2])
+    #         R[1, 0] = -R[0, 1]
+    #         R[1, 1] = R[0, 0]
+
+    #         # Add the neighbor node to the MST.
+    #         node = TileNode(
+    #             cfg=self.cfg,
+    #             img=img,
+    #             parent=root,
+    #             position=position,
+    #             transformation=(T @ R),
+    #         )
+    #         tile_nodes.append(node)
+
+    #     return tile_nodes
+
+    # def _get_slam_transformations(self, vertices, edges, grid_size):
+    #     """Retrieves transformations between adjacent vertices in a SLAM graph. The
+    #     transformations are scored by errors corresponding to the associated edge.
+
+    #     :param vertices: Indexed dictionary of SLAM graph vertices.
+    #     :param edges: Indexed dictionary of SLAM graph edges.
+    #     :param grid_size: Size of the stitched grid.
+    #     :return: Adjacency matrix of scored SLAM graph transformations.
+    #     """
+    #     # Go over all vertices (and the tiles they represent) from top to bottom and
+    #     # left to right and register their transformations.
+    #     transformations = np.empty((len(vertices), len(vertices)), dtype=object)
+    #     for (row, column) in np.ndindex(grid_size):
+    #         # Get neighbors in top-to-bottom, left-to-right order.
+    #         neighbors = []
+    #         if row < grid_size[0] - 1:
+    #             neighbors.append((row + 1, column))
+    #         if column < grid_size[1] - 1:
+    #             neighbors.append((row, column + 1))
+
+    #         for position_neigh in neighbors:
+    #             index = row * grid_size[1] + column
+    #             index_neigh = position_neigh[0] * grid_size[1] + position_neigh[1]
+
+    #             # Calculate translation and rotation matrices based on pose difference.
+    #             pose_difference = vertices[index_neigh].pose - vertices[index].pose
+
+    #             T = np.identity(3)
+    #             R = np.identity(3)
+
+    #             T[0, 2] = pose_difference[0]
+    #             T[1, 2] = pose_difference[1]
+    #             R[0, 0] = np.cos(pose_difference[2])
+    #             R[0, 1] = -np.sin(pose_difference[2])
+    #             R[1, 0] = -R[0, 1]
+    #             R[1, 1] = R[0, 0]
+
+    #             # Calculate score by comparing against the expected transformation.
+    #             # Angles are counted in degrees to increase their weight.
+    #             edge_index = f"{index}_{index_neigh}"
+    #             edge_estimate = edges[edge_index].estimate
+    #             error = abs(pose_difference - edge_estimate)
+    #             error[2] = np.degrees(error[2])
+    #             score = np.sum(np.array(error))
+
+    #             # Save the transformation and its score.
+    #             M = T @ R
+    #             transformations[index, index_neigh] = (M, score)
+    #             transformations[index_neigh, index] = (np.linalg.inv(M), score)
+
+    #     return transformations
+
+    # def stitch_grid_slam(self, tile_paths, plot_prefix=""):
+    #     """Stitch images in a grid using SLAM optimisation. Cannot be done when using
+    #     full perspective transformations.
+
+    #     :param tile_paths: Paths to image tiles in the grid.
+    #     :param plot_prefix: Prefix for plots generated during stitching.
+    #     :return: Stitched grid image and the coordinates of the reference tile.
+    #     """
+    #     if self.cfg.STITCHER.TRANSFORM_TYPE == "perspective":
+    #         raise ValueError(
+    #             "Perspective transformations are not supported when "
+    #             "using SLAM optimisation."
+    #         )
+
+    #     grid_size = tile_paths.shape
+    #     tile_count = grid_size[0] * grid_size[1]
+    #     if tile_count < 2:
+    #         raise ValueError(f"Cannot stitch a single tile: {tile_paths[0, 0]}")
+
+    #     # Find LoFTR or SIFT keypoint matches between each pairs of adjacent image
+    #     # tiles from the top left image to the bottom right image. Use the matches
+    #     # to build a SLAM model of the stitched tiles.
+    #     vertices = {}
+    #     edges = {}
+    #     for (row, column), tile_path in np.ndenumerate(tile_paths):
+    #         # Get neighbors in top-to-bottom, left-to-right order.
+    #         neighbors = []
+    #         if row < grid_size[0] - 1:
+    #             neighbors.append((row + 1, column))
+    #         if column < grid_size[1] - 1:
+    #             neighbors.append((row, column + 1))
+
+    #         img = None
+    #         node = None
+    #         for position_neigh in neighbors:
+    #             # Load the images.
+    #             neighbor_path = tile_paths[position_neigh]
+    #             if img is None:
+    #                 img = self.img_loader.load_img(tile_path)
+    #             img_neigh = self.img_loader.load_img(neighbor_path)
+
+    #             # Represent neighbor transformations using a tree.
+    #             if node is None:
+    #                 node = TileNode(
+    #                     cfg=self.cfg,
+    #                     img=img,
+    #                     position=(row, column),
+    #                     transformation=np.identity(3),
+    #                 )
+
+    #             # Compute neighbor matches.
+    #             matches, matches_neigh, conf = self.compute_neighbor_matches(
+    #                 position=(row, column),
+    #                 position_neigh=position_neigh,
+    #                 img=img,
+    #                 img_neigh=img_neigh,
+    #             )
+
+    #             # Make matching figure if desired.
+    #             if self.cfg.STITCHER.SAVE_MATCHES:
+    #                 self._plot_matches(
+    #                     img,
+    #                     img_neigh,
+    #                     matches,
+    #                     matches_neigh,
+    #                     conf,
+    #                     (row, column),
+    #                     position_neigh,
+    #                     self.cfg.STITCHER.SAVE_MATCHES_FRACTION,
+    #                     plot_prefix,
+    #                 )
+
+    #             # Ensure there is enough matches.
+    #             if len(matches) < 3:
+    #                 print(
+    #                     "Not enough matches found for image pair: "
+    #                     f"{(tile_path, neighbor_path)}"
+    #                 )
+    #                 continue
+
+    #             # Calculate the neighbor transformation.
+    #             node_neigh = TileNode(
+    #                 cfg=self.cfg,
+    #                 img=img_neigh,
+    #                 position=position_neigh,
+    #                 parent=node,
+    #                 matches=matches_neigh,
+    #                 matches_parent=matches,
+    #             )
+    #             node_neigh.estimate_transformation()
+    #             pose = node_neigh.remove_scaling()
+
+    #             # Build vertices with initial position estimates.
+    #             index = row * grid_size[1] + column
+    #             index_neigh = position_neigh[0] * grid_size[1] + position_neigh[1]
+    #             if index not in vertices:
+    #                 vertices[index] = self._get_slam_vertex(
+    #                     img, (row, column), grid_size
+    #                 )
+    #             if index_neigh not in vertices:
+    #                 vertices[index_neigh] = self._get_slam_vertex(
+    #                     img_neigh, position_neigh, grid_size
+    #                 )
+
+    #             # Add edges with homography-based translation and rotation estimates.
+    #             edge_index = f"{index}_{index_neigh}"
+    #             edges[edge_index] = self._get_slam_edge(index, index_neigh, pose)
+
+    #     # Build the SLAM graph and optimise.
+    #     slam_graph = Graph(list(edges.values()), list(vertices.values()))
+    #     stdout = sys.stdout
+    #     try:
+    #         sys.stdout = io.StringIO()
+    #         slam_graph.optimize()
+    #     finally:
+    #         sys.stdout = stdout
+
+    #     # Convert the graph to a simple MST (all nodes connected directly to
+    #     # the root node) and stitch the grid using MST stitching.
+    #     tile_nodes = self._slam_graph_to_mst(vertices, tile_paths)
+    #     return self.stitch_mst_nodes(tile_nodes)
+

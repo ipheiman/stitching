@@ -109,7 +109,16 @@ if __name__ == "__main__":
             out_filename = f"g{int(grid_index):05d}_s00000.png"
             out_path = os.path.join(cfg.STITCHER.OUTPUT_PATH, out_filename)
             cv2.imwrite(out_path, stitched_image)
+
     else:
+        '''
+        # Stitch image tiles in the selected grids based on the given configuration.
+        loader = DatasetLoader(cfg.DATASET.PATH)
+        image_paths = loader.load_paths()
+        img_loader = ImageLoader(cfg)
+        stitcher = DemisStitcher(cfg, img_loader)
+
+        '''        
         length = len(selected_grids) if selected_grids is not None else len(image_paths)
         for path_key, tile_paths in image_paths.items():
             # Select grids to stitch.
@@ -133,3 +142,5 @@ if __name__ == "__main__":
             out_filename = f"g{int(grid_index):05d}_s{int(slice_index):05d}.png"
             out_path = os.path.join(cfg.STITCHER.OUTPUT_PATH, out_filename)
             cv2.imwrite(out_path, stitched_image)
+
+

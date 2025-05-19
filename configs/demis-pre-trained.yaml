@@ -1,12 +1,12 @@
 DATASET:
   PATH: "datasets/DEMIS"
-  TILE_OVERLAP: 0.3
+  TILE_OVERLAP: 0.3 # for tile strip
 STITCHER:
   OUTPUT_PATH: "output/DEMIS"
-  RESOLUTION_RATIO: 0.5
-  MATCHING_METHOD: "loftr"
-  TRANSFORM_TYPE: "affine"
-  CONSTRUCTION_METHOD: "slam"
+  RESOLUTION_RATIO: 0.5 # for resize
+  MATCHING_METHOD: "loftr" # loftr or sift
+  TRANSFORM_TYPE: "affine" # affine or perspective or partial-affine
+  CONSTRUCTION_METHOD: "slam" # slam or mst
   COMPOSITING_METHOD: "overwrite"
   COLORED_OUTPUT: False
   NORMALISE_INTENSITY: True

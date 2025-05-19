@@ -1,0 +1,15 @@
+DATASET:
+  PATH: "datasets/5x5"
+  TILE_OVERLAP: 0.3
+STITCHER:
+  OUTPUT_PATH: "output/5x5"
+  RESOLUTION_RATIO: 0.5
+  MATCHING_METHOD: "loftr"
+  TRANSFORM_TYPE: "affine"
+  CONSTRUCTION_METHOD: "slam"
+  COMPOSITING_METHOD: "overwrite"
+  COLORED_OUTPUT: False
+  NORMALISE_INTENSITY: True
+LOFTR:
+  CHECKPOINT_PATH: "LoFTR/weights/outdoor_ds.ckpt"
+  #  "LoFTR/weights/demis_ds.ckpt"

@@ -71,7 +71,7 @@ class TileStitcher:
         :param img_crop: Cropped image.
         :param side: From which side cropping was performed (t/b/l/r for
                      top/bottom/left/right).
-        :return: Cropped image.
+        :return: keypoints
         """
         height_crop, width_crop = img_crop.shape
         height_full, width_full = img_full.shape
@@ -162,12 +162,17 @@ class TileStitcher:
             )
 
         # Convert keypoint coordinates to full image space.
+
+        # Keypoints1
         matches1 = self.correct_keypoint_positions(
             matches1, img1_full, img1, img1_position
         )
+        # Keypoints2
         matches2 = self.correct_keypoint_positions(
             matches2, img2_full, img2, img2_position
         )
+
+        # conf based on LOFTR
         return matches1, matches2, conf
 
     def stitch_tile(self, combined_image, tile_node, translation=None):
@@ -196,6 +201,7 @@ class TileStitcher:
         )
 
         # Compose the final image.
+        # 3 ways to blend the tiles: Overwrite, Average, Distance-weighted 
         if self.cfg.STITCHER.COMPOSITING_METHOD == "overwrite":
             # Simply overwrite overlapping pixels by the original image.
             mask = combined_image > 0
